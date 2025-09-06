@@ -393,9 +393,7 @@ def main():
     
     inputs  = jnp.array(inputs.astype(np.float32))
     outputs = jnp.array(outputs.reshape(-1, n_train).astype(np.float32))
-    
-    print(jax.mean(outputs))
-    
+        
     Nelem_x, Nelem_y = config.domain.Nelem_x, config.domain.Nelem_y
     N_nodes = (Nelem_x-1) * (Nelem_y-1) # interior nodes only
     N_quad_1d = config.domain.N_quad  # Number of quadrature points per dimension

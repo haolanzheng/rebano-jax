@@ -1,0 +1,6 @@
+__pycache__/
+wandb/
+ckpts/
+# macOS
+.DS_Store
+*.npy

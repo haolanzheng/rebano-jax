@@ -1,6 +1,10 @@
 import os
 if os.environ.get("CUDA_VISIBLE_DEVICES") in (None, "", "-1"):
-    os.environ.setdefault("JAX_NUM_CPU_DEVICES", "5")
+    os.environ.setdefault("JAX_NUM_CPU_DEVICES", "4")  # Use more CPU devices
+    
+# Suppress XLA autotuning warnings
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+os.environ.setdefault("XLA_FLAGS", "--xla_cpu_multi_thread_eigen=false")
 import numpy as np
 import jax
 import jax.numpy as jnp

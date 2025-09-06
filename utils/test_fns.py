@@ -84,7 +84,7 @@ def gram_mat(Nx, Ny, dx, dy):
                  max(-dj,0):v.shape[1]-max(dj,0)]
 
     def G(x):
-        u = x.reshape(Nx, Ny)
+        u = x.reshape(Ny, Nx)
         y = (v1*u # center
              + v2*(shift(u, -1, 0)+shift(u, 1, 0)) # N and S neighbors
              + v3*(shift(u, 0, -1)+shift(u, 0, 1)) # W and E neighbors

@@ -1,9 +1,15 @@
 import os
 if os.environ.get("CUDA_VISIBLE_DEVICES") in (None, "", "-1"):
-    os.environ.setdefault("JAX_NUM_CPU_DEVICES", "1")
+    os.environ.setdefault("JAX_NUM_CPU_DEVICES", "4")  # Use more CPU devices for better parallelization
+    
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+os.environ.setdefault("XLA_FLAGS", "--xla_cpu_multi_thread_eigen=false")
+
 import numpy as np
 import jax
 import jax.numpy as jnp
+from jax import config
+config.update("jax_log_compiles", False)
 from jax import jit, pmap, vmap, devices, local_device_count
 from jax.scipy.interpolate import RegularGridInterpolator
 from ml_collections import ConfigDict
@@ -71,8 +77,9 @@ def train_pinn(state, col_points, quad_weights, test_fn_values, grad_test_fn_val
             }
             wandb.log(log_data)
         
-        if step % 1000 == 0:
-            tqdm.write(f"Step {step}: Total={metrics['total_loss']:.5e}")
+        if step % 5000 == 0:
+            tqdm.write(f"Step {step}: Total={metrics['total_loss']:.5e}, "
+                       f"Residual={metrics['residual_loss']:.5e}, BC={metrics['boundary_loss']:.5e}")
         
         if metrics['grad_norm'] < tol_grad:
             tqdm.write(f"Converged at step {step}, final loss: {metrics['total_loss']:.5e}")
@@ -240,7 +247,7 @@ def train_rebano_pmap(config_rebano, pinns, col_points, quad_weights,
 
 
 def prepare_pmap_batch(a_data, start_idx, end_idx, batch_size, n_devices):
-    """Prepare data for pmap - reshape to (n_devices, Nelem-1, N_quad, batch_size)"""
+    """Prepare data for pmap - reshape to (n_devices, N_nodes, N_quad, batch_size)"""
     actual_samples = end_idx - start_idx
     total_batch_size = batch_size * n_devices
     
@@ -284,7 +291,7 @@ def train_rebano_sequential(config_rebano, pinns, col_points,
     def boundary_loss_grad_rebano(params, quad_weights, loss_data=None):
             return darcy_boundary_loss_grad(params, u_bc_precomp, quad_weights)
 
-    n_samples = f_data.shape[-1]
+    n_samples = a_data.shape[-1]
     n_neurons = len(pinns)
     
     dummy_key = jax.random.PRNGKey(0)
@@ -387,8 +394,10 @@ def main():
     inputs  = jnp.array(inputs.astype(np.float32))
     outputs = jnp.array(outputs.reshape(-1, n_train).astype(np.float32))
     
+    print(jax.mean(outputs))
+    
     Nelem_x, Nelem_y = config.domain.Nelem_x, config.domain.Nelem_y
-    Nelem = (Nelem_x-1) * (Nelem_y-1)
+    N_nodes = (Nelem_x-1) * (Nelem_y-1) # interior nodes only
     N_quad_1d = config.domain.N_quad  # Number of quadrature points per dimension
     N_quad = N_quad_1d**2  # Total quadrature points per element
     N_bc   = config.domain.N_bc 
@@ -396,7 +405,7 @@ def main():
     Yi, Yf = config.domain.Yi, config.domain.Yf
     
     # Create test grid matching input spatial dimensions  
-    xy_test, _ = spatial_grid2d(Xi, Xf, Yi, Yf, Nx, Ny, 'uniform')
+    xy_test = spatial_grid2d(Xi, Xf, Yi, Yf, Nx, Ny, 'uniform')[0]
 
     x_grid, y_grid = spatial_grid1d(Xi, Xf, Nelem_x+1, sampling_method='uniform', endpoint=True)[0], spatial_grid1d(Yi, Yf, Nelem_y+1, sampling_method='uniform', endpoint=True)[0]
     dx, dy = x_grid[1]-x_grid[0], y_grid[1]-y_grid[0]
@@ -424,17 +433,18 @@ def main():
             xy_elem, weight_elem = spatial_grid2d(x_grid[j], x_grid[j+2], y_grid[i], y_grid[i+2], N_quad_1d, N_quad_1d, 'gauss')
             
             quad_xy = quad_xy.at[i, j].set(xy_elem)
-            quadw_xy = quadw_xy.at[i, j].set(weight_elem.flatten())
+            quadw_xy = quadw_xy.at[i, j].set(weight_elem.squeeze(-1))
             
             test_fn_elem = test_fn_linear2d(x_grid[j], x_grid[j+1], x_grid[j+2], y_grid[i], y_grid[i+1], y_grid[i+2], xy_elem)
             grad_test_fn_elem = grad_test_fn_linear2d(x_grid[j], x_grid[j+1], x_grid[j+2], y_grid[i], y_grid[i+1], y_grid[i+2], xy_elem)
             test_fn_values = test_fn_values.at[i, j].set(test_fn_elem)
             grad_test_fn_values = grad_test_fn_values.at[i, j].set(grad_test_fn_elem)
     
-    quad_xy = quad_xy.reshape(Nelem, N_quad, 2)
-    quadw_xy = quadw_xy.reshape(Nelem, N_quad)
-    test_fn_values = test_fn_values.reshape(Nelem, N_quad)
-    grad_test_fn_values = grad_test_fn_values.reshape(Nelem, N_quad, 2)
+    quad_xy = quad_xy.reshape(N_nodes, N_quad, 2)
+    quadw_xy = quadw_xy.reshape(N_nodes, N_quad)
+    test_fn_values = test_fn_values.reshape(N_nodes, N_quad)
+    grad_test_fn_values = grad_test_fn_values.reshape(N_nodes, N_quad, 2)
+    
 
     a_fns = []
     for i in range(n_train):
@@ -447,17 +457,17 @@ def main():
         )
         a_fns.append(interpolator)
     
-    a_data = jnp.zeros((Nelem, N_quad, n_train))
+    a_data = jnp.zeros((N_nodes, N_quad, n_train))
     for i in range(n_train):
         a_val_flat = a_fns[i](quad_xy.reshape(-1, 2))
-        a_val = a_val_flat.reshape(Nelem, N_quad)
+        a_val = a_val_flat.reshape(N_nodes, N_quad)
         a_data = a_data.at[:, :, i].set(a_val)
 
     if jnp.any(jnp.isnan(a_data)):
         raise ValueError("NaN values found in a_data")
         
+    f_data = jnp.ones((N_nodes, N_quad), dtype=jnp.float32)
     
-    f_data = jnp.ones((Nelem, N_quad), dtype=jnp.float32)
     key = jax.random.PRNGKey(config.seed)
 
     print('\nTotal number of input functions', inputs.shape[-1])
@@ -476,7 +486,7 @@ def main():
 
     train_rebano_config = config.train
 
-    grad_u_precomp = jnp.zeros((num_neurons, Nelem, N_quad, 2))
+    grad_u_precomp = jnp.zeros((num_neurons, N_nodes, N_quad, 2))
     u_bc_precomp   = jnp.zeros((num_neurons, 4, N_bc))
     
     pinn_list = []
@@ -542,7 +552,8 @@ def main():
         n = i + num_pretrain_neurons
         pinn   = PINN(config.pinn)
         a_pinn = a_data[..., idx_max]
-        
+        # a_pinn = jnp.ones((N_nodes, N_quad), dtype=jnp.float32)
+        # f_data = 2 * jnp.pi**2 * jnp.sin(jnp.pi * quad_xy)[..., 0] * jnp.sin(jnp.pi * quad_xy[..., 1])
         print(f"\nStart training PINN #{n+1} with input function index {idx_max} ...\n")
         
         loss_data = {'residual': {'a': a_pinn, 'f': f_data}, 'boundary': None}
@@ -569,8 +580,9 @@ def main():
         params   = pinn_state.params
         u_fn     = vmap(lambda x: apply_fn(params, x))
     
-        u_pred   = u_fn(xy_test).flatten()
-        sol      = outputs[:, idx_max:idx_max+1].flatten()
+        u_pred   = u_fn(xy_test).squeeze()
+        sol      = outputs[:, idx_max]
+        # sol = jnp.sin(jnp.pi * xy_test[:, 0]) * jnp.sin(jnp.pi * xy_test[:, 1])
         l2_error = jnp.linalg.norm(u_pred - sol) / jnp.linalg.norm(sol)
         print(f"Relative L2 Error: {l2_error:.6e}")
     
@@ -592,7 +604,7 @@ def main():
         grad_u_values = vmap(lambda x: compute_grad_u(apply_fn, params, x))(quad_points['residual']).squeeze(-2)
         grad_u_precomp = grad_u_precomp.at[n].set(grad_u_values)
         u_bc_values = vmap(lambda x: apply_fn(params, x))(xy_bc_flatten).squeeze(-1)
-        u_bc_values = u_bc_values.reshape(4, N_bc)
+        u_bc_values = u_bc_values.reshape(xy_bc.shape[0], N_bc)
         u_bc_precomp = u_bc_precomp.at[n].set(u_bc_values)
         
     

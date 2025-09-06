@@ -18,7 +18,7 @@ except ImportError:
 
 Array = jax.Array
 
-def cg_solve(G, b, v1, tol=1e-6, maxiter=1000):
+def cg_solve(G, b, v1, tol=1e-12, maxiter=5000):
     
     G = G if callable(G) else lambda x: G @ x
 
@@ -71,20 +71,20 @@ def darcy_residual_loss(apply_fn: Callable,
     Args:
         apply_fn: PINN apply function;
         params: PINN parameters;
-        quad_points: Quadrature points (N_elem, N_quad, 2);
-        quad_weights: Quadrature weights (N_elem, N_quad);
-        test_fns_values: Test functions: Array of test functions {v_i} values at quadrature points (N_elem, N_quad);
-        grad_test_fn_values: Gradients of test functions: Array of gradients of test functions {∇v_i} values at quadrature points (N_elem, N_quad, xy_dim);
+        quad_points: Quadrature points (N_nodes, N_quad, 2);
+        quad_weights: Quadrature weights (N_nodes, N_quad);
+        test_fns_values: Test functions: Array of test functions {v_i} values at quadrature points (N_nodes, N_quad);
+        grad_test_fn_values: Gradients of test functions: Array of gradients of test functions {∇v_i} values at quadrature points (N_nodes, N_quad, xy_dim);
         gram_mat: function to compute the Gram matrix G matvec;
         v1: the diagnal preconditioner value for CG solve of Gram matrix system;
         loss_data: Loss data: dict of loss data ['a': a, 'f': f];
     """
 
-    a_data = loss_data['a'] # (N_elem, N_quad)
-    f_data = loss_data['f'] # (N_elem, N_quad)
-    points_flat = quad_points.reshape(-1, quad_points.shape[-1])  # (N_elem*N_quad, 2)
-    grad_flat = vmap(partial(grad_u, apply_fn, params))(points_flat).squeeze(axis=-2) # (N_elem*N_quad, xy_dim)
-    grad_u_vals = grad_flat.reshape(quad_points.shape[0], quad_points.shape[1], -1)  # (N_elem, N_quad, xy_dim)
+    a_data = loss_data['a'] # (N_nodes, N_quad)
+    f_data = loss_data['f'] # (N_nodes, N_quad)
+    points_flat = quad_points.reshape(-1, quad_points.shape[-1])  # (N_nodes*N_quad, 2)
+    grad_flat = vmap(partial(grad_u, apply_fn, params))(points_flat).squeeze(axis=-2) # (N_nodes*N_quad, xy_dim)
+    grad_u_vals = grad_flat.reshape(quad_points.shape)  # (N_nodes, N_quad, xy_dim)
 
     loss_fn = vmap(loss_single_elem, in_axes=0)
 
@@ -101,12 +101,10 @@ def darcy_boundary_loss(apply_fn: Callable,
     """ Get the boundary loss of Darcy problem with homogeneous Dirichlet BC """
     
     u_fn = get_u(apply_fn)
-    u_bc_b = vmap(partial(u_fn, params))(x_bc[0])
-    u_bc_r = vmap(partial(u_fn, params))(x_bc[1])
-    u_bc_t = vmap(partial(u_fn, params))(x_bc[2])
-    u_bc_l = vmap(partial(u_fn, params))(x_bc[3])
     
-    loss_b = jnp.sum(quad_weights[0]*u_bc_b**2) + jnp.sum(quad_weights[1]*u_bc_r**2) + jnp.sum(quad_weights[2]*u_bc_t**2) + jnp.sum(quad_weights[3]*u_bc_l**2)
+    u_bc = vmap(partial(u_fn, params))(x_bc.reshape(-1, x_bc.shape[-1]))
+
+    loss_b = jnp.sum(quad_weights.reshape(-1, 1)*u_bc**2)
 
     return loss_b
 
@@ -121,16 +119,16 @@ def darcy_residual_loss_precomp(params: Any,
     """ 
     Compute the loss with precomputed gradients of u: u = ⫇_i c_iu_i.
     Args:
-        grad_u_precomp: Precomputed gradients of u at quadrature points (n_neurons, N_elem, N_quad, xy_dim);
+        grad_u_precomp: Precomputed gradients of u at quadrature points (n_neurons, N_nodes, N_quad, xy_dim);
     """
 
-    a_data = loss_data['a'] # (N_elem, N_quad)
-    f_data = loss_data['f'] # (N_elem, N_quad)
+    a_data = loss_data['a'] # (N_nodes, N_quad)
+    f_data = loss_data['f'] # (N_nodes, N_quad)
 
-    grad_u_precomp = jnp.transpose(grad_u_precomp, (1, 0, 2, 3))  # (N_elem, n_neurons, N_quad, xy_dim)
+    grad_u_precomp = jnp.transpose(grad_u_precomp, (1, 0, 2, 3))  # (N_nodes, n_neurons, N_quad, xy_dim)
     # print(grad_u_precomp.shape)
     coef = params['params']['coefficients']
-    grad_u_rb = jnp.einsum('i,eijk->ejk', coef, grad_u_precomp)  # (N_elem, N_quad, xy_dim)
+    grad_u_rb = jnp.einsum('i,eijk->ejk', coef, grad_u_precomp)  # (N_nodes, N_quad, xy_dim)
     
     loss_fn = vmap(loss_single_elem, in_axes=0)
 
@@ -141,17 +139,14 @@ def darcy_residual_loss_precomp(params: Any,
     return total_loss
 
 def darcy_boundary_loss_precomp(params: Any,
-                                quad_weights: Array,
-                                u_bc: Array):
+                                u_bc: Array,
+                                quad_weights: Array):
     """ Get the boundary loss of Darcy problem with homogeneous Dirichlet BC """
     coef = params['params']['coefficients']
-    u_bc = u_bc.transpose((1, 0, 2))
-    u_bc_rb_b = jnp.einsum('i,ij->j', coef, u_bc[0])
-    u_bc_rb_r = jnp.einsum('i,ij->j', coef, u_bc[1])
-    u_bc_rb_t = jnp.einsum('i,ij->j', coef, u_bc[2])
-    u_bc_rb_l = jnp.einsum('i,ij->j', coef, u_bc[3])
+    u_bc = u_bc.reshape(u_bc.shape[0], -1)
+    u_bc_rb = jnp.einsum('i,ij->j', coef, u_bc)
 
-    loss_b = jnp.sum(quad_weights[0]*u_bc_rb_b**2) + jnp.sum(quad_weights[1]*u_bc_rb_r**2) + jnp.sum(quad_weights[2]*u_bc_rb_t**2) + jnp.sum(quad_weights[3]*u_bc_rb_l**2)
+    loss_b = jnp.sum(quad_weights.flatten()*u_bc_rb**2)
 
     return loss_b
 
@@ -166,16 +161,16 @@ def darcy_residual_loss_grad(params: Any,
     """ 
     Compute the loss with precomputed gradients of u.
     Args:
-        grad_u_precomp: Precomputed gradients of u at quadrature points (n_neurons, N_elem, N_quad, xy_dim);
+        grad_u_precomp: Precomputed gradients of u at quadrature points (n_neurons, N_nodes, N_quad, xy_dim);
     """
 
-    a_data = loss_data['a'] # (N_elem, N_quad)
-    f_data = loss_data['f'] # (N_elem, N_quad)
+    a_data = loss_data['a'] # (N_nodes, N_quad)
+    f_data = loss_data['f'] # (N_nodes, N_quad)
     
-    grad_u_precomp = jnp.transpose(grad_u_precomp, (1, 0, 2, 3))  # (N_elem, n_neurons, N_quad, xy_dim)
+    grad_u_precomp = jnp.transpose(grad_u_precomp, (1, 0, 2, 3))  # (N_nodes, n_neurons, N_quad, xy_dim)
     
     coef = params['params']['coefficients']
-    grad_u_rb = jnp.einsum('i,eijk->ejk', coef, grad_u_precomp)  # (N_elem, N_quad, xy_dim)
+    grad_u_rb = jnp.einsum('i,eijk->ejk', coef, grad_u_precomp)  # (N_nodes, N_quad, xy_dim)
     
     grad_loss_fn = vmap(grad_loss_single_elem, in_axes=0)
     
@@ -188,19 +183,13 @@ def darcy_residual_loss_grad(params: Any,
     return {'params': {'coefficients': grad}}
 
 def darcy_boundary_loss_grad(params: Any,
-                             quad_weights: Array,
-                                u_bc: Array):
+                             u_bc: Array,
+                             quad_weights: Array):
     """ Get the gradient of boundary loss of Darcy problem with homogeneous Dirichlet BC """
     coef = params['params']['coefficients']
-    u_bc = u_bc.transpose((1, 0, 2))
-    u_bc_rb_b = jnp.einsum('i,ij->j', coef, u_bc[0])
-    u_bc_rb_r = jnp.einsum('i,ij->j', coef, u_bc[1])
-    u_bc_rb_t = jnp.einsum('i,ij->j', coef, u_bc[2])
-    u_bc_rb_l = jnp.einsum('i,ij->j', coef, u_bc[3])
+    u_bc = u_bc.reshape(u_bc.shape[0], -1)
+    u_bc_rb = jnp.einsum('i,ij->j', coef, u_bc)
 
-    grad = 2.0 * jnp.sum(quad_weights[0]*u_bc_rb_b[None, :] * u_bc[0], axis=-1) + \
-           2.0 * jnp.sum(quad_weights[1]*u_bc_rb_r[None, :] * u_bc[1], axis=-1) + \
-           2.0 * jnp.sum(quad_weights[2]*u_bc_rb_t[None, :] * u_bc[2], axis=-1) + \
-           2.0 * jnp.sum(quad_weights[3]*u_bc_rb_l[None, :] * u_bc[3], axis=-1)
+    grad = 2.0 * jnp.sum(quad_weights.reshape(1, -1) * u_bc_rb[None, :] * u_bc)
 
     return {'params': {'coefficients': grad}}

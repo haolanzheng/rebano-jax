@@ -19,6 +19,8 @@ from tqdm import tqdm
 import wandb
 import time
 
+from matplotlib import pyplot as plt
+
 try:
     from ..models.nets import PINN, ReBaNO
     from .darcy_losses import *
@@ -446,7 +448,7 @@ def main():
 
     a_fns = []
     for i in range(n_train):
-        a_sample = inputs[:, :, i].T
+        a_sample = inputs[:, :, i]
         interpolator = RegularGridInterpolator(
             (x_interp_grid, y_interp_grid), 
             a_sample, 
@@ -463,7 +465,7 @@ def main():
 
     if jnp.any(jnp.isnan(a_data)):
         raise ValueError("NaN values found in a_data")
-        
+    
     f_data = jnp.ones((N_nodes, N_quad), dtype=jnp.float32)
     
     key = jax.random.PRNGKey(config.seed)
@@ -551,7 +553,7 @@ def main():
         pinn   = PINN(config.pinn)
         a_pinn = a_data[..., idx_max]
         # a_pinn = jnp.ones((N_nodes, N_quad), dtype=jnp.float32)
-        # f_data = 2 * jnp.pi**2 * jnp.sin(jnp.pi * quad_xy)[..., 0] * jnp.sin(jnp.pi * quad_xy[..., 1])
+        # f_data = 5 * jnp.pi**2 * jnp.sin(jnp.pi * quad_xy)[..., 0] * jnp.sin(2*jnp.pi * quad_xy[..., 1])
         print(f"\nStart training PINN #{n+1} with input function index {idx_max} ...\n")
         
         loss_data = {'residual': {'a': a_pinn, 'f': f_data}, 'boundary': None}
@@ -578,12 +580,33 @@ def main():
         params   = pinn_state.params
         u_fn     = vmap(lambda x: apply_fn(params, x))
     
-        u_pred   = u_fn(xy_test).squeeze()
-        sol      = outputs[:, idx_max]
-        # sol = jnp.sin(jnp.pi * xy_test[:, 0]) * jnp.sin(jnp.pi * xy_test[:, 1])
+        u_pred   = u_fn(xy_test).reshape(Ny, Nx)
+        sol      = outputs[:, idx_max].reshape(Ny, Nx)
+        # sol = jnp.sin(jnp.pi * xy_test[:, 0]) * jnp.sin(2*jnp.pi * xy_test[:, 1])
         l2_error = jnp.linalg.norm(u_pred - sol) / jnp.linalg.norm(sol)
         print(f"Relative L2 Error: {l2_error:.6e}")
-    
+        
+        xx, yy = np.meshgrid(x_interp_grid, y_interp_grid, indexing='xy')
+        
+        fig, ax = plt.subplots(1, 3, figsize=(14, 4))
+        
+        # Store the pcolormesh objects to add colorbars
+        im0 = ax[0].pcolormesh(xx, yy, np.array(u_pred), cmap='viridis')
+        im1 = ax[1].pcolormesh(xx, yy, np.array(sol), cmap='viridis')
+        im2 = ax[2].pcolormesh(xx, yy, np.array(jnp.abs(u_pred - sol)), cmap='plasma')
+
+        ax[0].set_title('PINN Prediction')
+        ax[1].set_title('FEM Solution')
+        ax[2].set_title('Absolute Error')
+        
+        # Add colorbars for each subplot
+        fig.colorbar(im0, ax=ax[0], fraction=0.046, pad=0.04)
+        fig.colorbar(im1, ax=ax[1], fraction=0.046, pad=0.04)
+        fig.colorbar(im2, ax=ax[2], fraction=0.046, pad=0.04)
+
+        fig.tight_layout()
+        plt.savefig(f"./pinn_sol{n+1}.pdf")
+
         metadata = {
             'training resolution': a_pinn.shape[0]*a_pinn.shape[1],
             'input function': a_pinn,

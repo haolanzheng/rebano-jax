@@ -64,10 +64,10 @@ def get_train_config():
     config.pinn       = pinn = ConfigDict()
     pinn.arch        = 'PirateNet'
     pinn.num_layers  = 6
-    pinn.hidden_dim  = 128
+    pinn.hidden_dim  = 64
     pinn.out_dim     = 1
     pinn.embed_scale = 0.1
-    pinn.embed_dim   = 128
+    pinn.embed_dim   = 256
     pinn.init_fn     = 'glorot_normal'
     pinn.activation  = 'sin'
     pinn.fact_weight = True
@@ -76,14 +76,14 @@ def get_train_config():
     pinn.train             = pinn_train = ConfigDict()
     pinn_train.optimizer   = 'Adam'
     pinn_train.lr          = 0.005
-    pinn_train.decay_steps = 10000
-    pinn_train.decay_rate  = 0.5
+    pinn_train.decay_steps = 5000
+    pinn_train.decay_rate  = 0.8
     pinn_train.max_steps   = 40000
     pinn_train.save_dir    = 'ckpts/pinn/'
     pinn_train.update_weights = False
-    pinn_train.w_residual     = 10.0
-    pinn_train.w_bc           = 1.0
-    pinn_train.alpha          = 0.8
+    pinn_train.w_residual     = 50.0
+    pinn_train.w_bc           = 2.0
+    pinn_train.alpha          = 0.9
 
     return config
     

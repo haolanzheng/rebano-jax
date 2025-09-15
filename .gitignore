@@ -5,6 +5,7 @@ logs/
 data/
 *.npy
 *.pdf
+*.sh
 # macOS
 .DS_Store
 

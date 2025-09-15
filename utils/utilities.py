@@ -162,3 +162,31 @@ def load_rebano(checkpoint_path: str):
         return u_fn(params, x)
     
     return model
+
+def prepare_pmap_batch(f_data, start_idx, end_idx, batch_size, n_devices, batch_axis=0):
+    """Prepare data for pmap - reshape to (n_devices, batch_size, ...)."""
+    actual_samples = end_idx - start_idx
+    total_batch_size = batch_size * n_devices
+    
+    if batch_axis == -1:
+        f_data = jnp.moveaxis(f_data, -1, 0)
+    elif batch_axis == 0:
+        f_data = f_data
+    else:
+        raise ValueError("batch_axis must be 0 or -1")
+    
+    if actual_samples < total_batch_size:
+        f_padded = jnp.zeros((total_batch_size, *f_data.shape[1:]))
+        f_padded = f_padded.at[:actual_samples, ...].set(f_data[start_idx:end_idx, ...])
+        if actual_samples > 0:
+            last_sample = f_data[end_idx-1:end_idx, ...]
+            for i in range(actual_samples, total_batch_size):
+                f_padded = f_padded.at[i:i+1, ...].set(last_sample)
+        f_batch = f_padded
+    else:
+        f_batch = f_data[start_idx:start_idx + total_batch_size, ...]
+
+
+    f_batch = f_batch.reshape(n_devices, batch_size, *f_data.shape[1:])
+
+    return f_batch

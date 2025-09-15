@@ -1,6 +1,10 @@
 __pycache__/
 wandb/
 ckpts/
+logs/
+data/
+*.npy
+*.pdf
 # macOS
 .DS_Store
-*.npy
+

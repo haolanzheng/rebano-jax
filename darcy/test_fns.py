@@ -6,10 +6,10 @@ from typing import Any
 import sys, os
 
 try:
-    from .grids import spatial_grid1d, spatial_grid2d
+    from ..utils.grids import spatial_grid1d, spatial_grid2d
 except ImportError:
     sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    from grids import spatial_grid1d, spatial_grid2d
+    from utils.grids import spatial_grid1d, spatial_grid2d
 
 Array = jax.Array
 
@@ -73,7 +73,7 @@ def gram_coef(dx, dy):
     
     return v1, v2, v3, v4
 
-def gram_mat(Nx, Ny, dx, dy):
+def gram_mat(Nx, Ny, dx, dy, form='algebraic'):
 
     v1, v2, v3, v4 = gram_coef(dx, dy)
 
@@ -83,14 +83,24 @@ def gram_mat(Nx, Ny, dx, dy):
         return v[max(-di,0):v.shape[0]-max(di,0),
                  max(-dj,0):v.shape[1]-max(dj,0)]
 
-    def G(x):
-        u = x.reshape(Ny, Nx)
-        y = (v1*u # center
-             + v2*(shift(u, -1, 0)+shift(u, 1, 0)) # N and S neighbors
-             + v3*(shift(u, 0, -1)+shift(u, 0, 1)) # W and E neighbors
-             + v4*(shift(u, -1, -1)+shift(u, -1, 1)+shift(u, 1, -1)+shift(u, 1, 1))) # NW, NE, SW, SE neighbors
-        return y.ravel()
-    return jit(G)
+    if form == 'functional':
+        def G(x):
+            u = x.reshape(Ny, Nx)
+            y = (v1*u # center
+                + v2*(shift(u, -1, 0)+shift(u, 1, 0)) # N and S neighbors
+                + v3*(shift(u, 0, -1)+shift(u, 0, 1)) # W and E neighbors
+                + v4*(shift(u, -1, -1)+shift(u, -1, 1)+shift(u, 1, -1)+shift(u, 1, 1))) # NW, NE, SW, SE neighbors
+            return y.ravel()
+        return jit(G)
+    
+    elif form == 'algebraic':
+        Ix, Iy = jnp.eye(Nx), jnp.eye(Ny)
+        Dx, Dy = jnp.diag(jnp.ones(Nx-1), 1) + jnp.diag(jnp.ones(Nx-1), -1), jnp.diag(jnp.ones(Ny-1), 1) + jnp.diag(jnp.ones(Ny-1), -1)
+        
+        G = v1 * jnp.kron(Iy, Ix) + v2 * jnp.kron(Dy, Ix) + v3 * jnp.kron(Iy, Dx) + v4 * jnp.kron(Dy, Dx)
+        
+        return G
+        
     
     
     

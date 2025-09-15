@@ -18,15 +18,13 @@ except ImportError:
 
 Array = jax.Array
 
-def cg_solve(G, b, v1, tol=1e-12, maxiter=5000):
+def cg_solve(G, b, G_diag=None, tol=1e-12, maxiter=5000):
     
-    G = G if callable(G) else lambda x: G @ x
-
-    M = lambda z: z / v1
+    G_func = G if callable(G) else (lambda x: G @ x)
+    diag = G_diag if callable(G) else jnp.diag(G)
+    M = lambda z: z / diag
     
-    x = cg(G, b, M=M, tol=tol, maxiter=maxiter)[0]
-    
-    return x
+    return cg(G_func, b, M=M, tol=tol, maxiter=maxiter)[0]
      
 
 def loss_single_elem(quad_w_elem: Array,
@@ -63,7 +61,7 @@ def darcy_residual_loss(apply_fn: Callable,
                 test_fn_values: Array,
                 grad_test_fn_values: Array,
                 gram_mat: Callable,
-                v1: float,
+                G_diag: float,
                 loss_data: Any) -> float:
     """ Compute the variational loss for the Darcy problem: - ∇⋅(a ∇u) = f. The loss is given by L = R^T @ G^-1 @ R, where 
                 R[i] := ∫a ∇u ⋅ ∇v[i] dx - ∫fv[i] dx
@@ -76,7 +74,7 @@ def darcy_residual_loss(apply_fn: Callable,
         test_fns_values: Test functions: Array of test functions {v_i} values at quadrature points (N_nodes, N_quad);
         grad_test_fn_values: Gradients of test functions: Array of gradients of test functions {∇v_i} values at quadrature points (N_nodes, N_quad, xy_dim);
         gram_mat: function to compute the Gram matrix G matvec;
-        v1: the diagnal preconditioner value for CG solve of Gram matrix system;
+        G_diag: the diagnal preconditioner value for CG solve of Gram matrix system;
         loss_data: Loss data: dict of loss data ['a': a, 'f': f];
     """
 
@@ -90,7 +88,7 @@ def darcy_residual_loss(apply_fn: Callable,
 
     R = loss_fn(quad_weights, a_data, f_data, grad_u_vals, test_fn_values, grad_test_fn_values)
 
-    total_loss = R.T @ cg_solve(gram_mat, R, v1)
+    total_loss = R.T @ cg_solve(gram_mat, R, G_diag)
 
     return total_loss
 
@@ -114,7 +112,7 @@ def darcy_residual_loss_precomp(params: Any,
                         test_fn_values: Array,
                         grad_test_fn_values: Array,
                         gram_mat: Callable,
-                        v1: float,
+                        G_diag: float,
                         loss_data: Any) -> float:
     """ 
     Compute the loss with precomputed gradients of u: u = ⫇_i c_iu_i.
@@ -134,7 +132,7 @@ def darcy_residual_loss_precomp(params: Any,
 
     R = loss_fn(quad_weights, a_data, f_data, grad_u_rb, test_fn_values, grad_test_fn_values)
 
-    total_loss = R.T @ cg_solve(gram_mat, R, v1)
+    total_loss = R.T @ cg_solve(gram_mat, R, G_diag)
 
     return total_loss
 
@@ -156,7 +154,7 @@ def darcy_residual_loss_grad(params: Any,
                         test_fn_values: Array,
                         grad_test_fn_values: Array,
                         gram_mat: Callable,
-                        v1: float,
+                        G_diag: float,
                         loss_data: Any) -> float:
     """ 
     Compute the loss with precomputed gradients of u.
@@ -178,7 +176,7 @@ def darcy_residual_loss_grad(params: Any,
 
     dR = grad_loss_fn(quad_weights, a_data, grad_u_precomp, grad_test_fn_values)
 
-    grad = 2.0 * dR.T @ cg_solve(gram_mat, R, v1)
+    grad = 2.0 * dR.T @ cg_solve(gram_mat, R, G_diag)
 
     return {'params': {'coefficients': grad}}
 

@@ -20,39 +20,39 @@ import wandb
 import time
 
 from matplotlib import pyplot as plt
+from matplotlib.ticker import ScalarFormatter
 
 try:
     from ..models.nets import PINN, ReBaNO
     from .darcy_losses import *
-    from ..train.training import make_step, create_train_state, make_step_rebano
+    from ..train.training import make_step, create_train_state, make_step_rebano, create_optimizer
     from ..train.precomp import compute_grad_u
     from ..configs.darcy_config import get_train_config
     from ..utils.grids import spatial_grid1d, spatial_grid2d, spatial_grid2d_bc
-    from ..utils.utilities import get_u, save_pinn_checkpoint, load_checkpoint, count_params
-    from ..utils.test_fns import *
+    from ..utils.utilities import get_u, save_pinn_checkpoint, load_checkpoint, count_params, prepare_pmap_batch
+    from .test_fns import *
 except ImportError:
     sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from models.nets import PINN, ReBaNO
     from darcy_losses import *
-    from train.training import make_step, create_train_state, make_step_rebano
+    from train.training import make_step, create_train_state, make_step_rebano, create_optimizer
     from train.precomp import compute_grad_u
     from configs.darcy_config import get_train_config
     from utils.grids import spatial_grid1d, spatial_grid2d, spatial_grid2d_bc
-    from utils.utilities import get_u, save_pinn_checkpoint, load_checkpoint, count_params
-    from utils.test_fns import *
+    from utils.utilities import get_u, save_pinn_checkpoint, load_checkpoint, count_params, prepare_pmap_batch
+    from test_fns import *
 
-
-
-def train_pinn(state, col_points, quad_weights, test_fn_values, grad_test_fn_values, gram_matrix, v1, loss_weights, alpha,
-               max_steps=10000, tol_grad=1e-8, wandb_config=None):
+def train_pinn(state, col_points, quad_weights, test_fn_values, grad_test_fn_values, gram_matrix, G_diag, loss_weights, alpha,
+               max_steps=10000, tol_grad=1e-8, update_weights=True, wandb_config=None):
     """Train the PINN model on the Darcy problem."""
     
     def residual_loss_pinn(apply_fn, params, batch_data, quad_weights, loss_data):
-        return darcy_residual_loss(apply_fn, params, batch_data, quad_weights, test_fn_values, grad_test_fn_values, gram_matrix, v1, loss_data)
+        return darcy_residual_loss(apply_fn, params, batch_data, quad_weights, test_fn_values, grad_test_fn_values, gram_matrix, G_diag, loss_data)
     
     def boundary_loss_pinn(apply_fn, params, batch_data, quad_weights, loss_data=None):
         return darcy_boundary_loss(apply_fn, params, batch_data, quad_weights)
 
+    
     loss_fns = {'residual': residual_loss_pinn, 'boundary': boundary_loss_pinn}
 
     step_fn = make_step(loss_fns)
@@ -62,7 +62,8 @@ def train_pinn(state, col_points, quad_weights, test_fn_values, grad_test_fn_val
     
     for step in pbar:
         state, loss_weights, metrics = step_fn(state, loss_weights,
-                                               col_points, quad_weights, alpha)
+                                               col_points, quad_weights, adaptive_weights=update_weights,
+                                               alpha=alpha)
         
         pbar.set_postfix({
             'Total loss': f"{metrics['total_loss']:.2e}"
@@ -90,28 +91,29 @@ def train_pinn(state, col_points, quad_weights, test_fn_values, grad_test_fn_val
         if step == max_steps - 1:
             tqdm.write(f"Final loss: {metrics['total_loss']:.5e}")
     
+    
     pbar.close()
-    return state
+    return state, loss_weights
 
 def train_rebano(config_rebano, pinns, col_points, quad_weights, a_data,
-                 f_data, test_fn_values, grad_test_fn_values, grad_u_precomp, u_bc_precomp, gram_matrix, v1, available_devices,
+                 f_data, test_fn_values, grad_test_fn_values, grad_u_precomp, u_bc_precomp, gram_matrix, G_diag, available_devices,
                  use_pmap, batch_size, wandb_config=None):
-    """Train the ReBaNO on the Poisson problem with pmap parallelization."""
+    """Train the ReBaNO on the Darcy problem with pmap parallelization."""
     
     n_devices = len(available_devices)
-    if not use_pmap or n_devices == 1:
+    if not use_pmap:
         print("Using sequential processing")
         return train_rebano_sequential(config_rebano, pinns, 
                                        col_points, quad_weights, a_data,
-                                       f_data, test_fn_values, grad_test_fn_values, grad_u_precomp, u_bc_precomp, gram_matrix, v1, wandb_config)
+                                       f_data, test_fn_values, grad_test_fn_values, grad_u_precomp, u_bc_precomp, gram_matrix, G_diag, wandb_config)
 
     print(f"Using pmap with {n_devices} devices, batch size {batch_size}")
     return train_rebano_pmap(config_rebano, pinns, col_points, 
-                             quad_weights, a_data, f_data, test_fn_values, grad_test_fn_values, grad_u_precomp,  u_bc_precomp, gram_matrix, v1, n_devices, batch_size, available_devices, wandb_config)
+                             quad_weights, a_data, f_data, test_fn_values, grad_test_fn_values, grad_u_precomp,  u_bc_precomp, gram_matrix, G_diag, n_devices, batch_size, available_devices, wandb_config)
 
 
 def train_rebano_pmap(config_rebano, pinns, col_points, quad_weights,
-                      a_data, f_data, test_fn_values, grad_test_fn_values, grad_u_precomp, u_bc_precomp, gram_matrix, v1, n_devices, batch_size, available_devices, wandb_config):
+                      a_data, f_data, test_fn_values, grad_test_fn_values, grad_u_precomp, u_bc_precomp, gram_matrix, G_diag, n_devices, batch_size, available_devices, wandb_config):
     """Parallel ReBaNO training using pmap."""
     try: 
         max_steps = config_rebano.max_steps
@@ -134,10 +136,10 @@ def train_rebano_pmap(config_rebano, pinns, col_points, quad_weights,
                                    col_points['residual'], loss_data)
 
         def residual_loss_rebano(params, quad_weights, loss_data):
-            return darcy_residual_loss_precomp(params, quad_weights, grad_u_precomp, test_fn_values, grad_test_fn_values, gram_matrix, v1, loss_data)
+            return darcy_residual_loss_precomp(params, quad_weights, grad_u_precomp, test_fn_values, grad_test_fn_values, gram_matrix, G_diag, loss_data)
 
         def residual_loss_grad_rebano(params, quad_weights, loss_data):
-            return darcy_residual_loss_grad(params, quad_weights, grad_u_precomp, test_fn_values, grad_test_fn_values, gram_matrix, v1, loss_data)
+            return darcy_residual_loss_grad(params, quad_weights, grad_u_precomp, test_fn_values, grad_test_fn_values, gram_matrix, G_diag, loss_data)
         
         def boundary_loss_rebano(params, quad_weights, loss_data=None):
             return darcy_boundary_loss_precomp(params, u_bc_precomp, quad_weights)
@@ -194,7 +196,7 @@ def train_rebano_pmap(config_rebano, pinns, col_points, quad_weights,
             break
         
         batch_a_data = prepare_pmap_batch(
-            a_data, start_idx, end_idx, samples_per_device_batch, n_devices
+            a_data, start_idx, end_idx, samples_per_device_batch, n_devices, batch_axis=-1
         )
         
         try:
@@ -248,31 +250,9 @@ def train_rebano_pmap(config_rebano, pinns, col_points, quad_weights,
     return global_idx_max, global_loss_max
 
 
-def prepare_pmap_batch(a_data, start_idx, end_idx, batch_size, n_devices):
-    """Prepare data for pmap - reshape to (n_devices, N_nodes, N_quad, batch_size)"""
-    actual_samples = end_idx - start_idx
-    total_batch_size = batch_size * n_devices
-    
-    if actual_samples < total_batch_size:
-        a_padded = jnp.zeros((a_data.shape[0], a_data.shape[1], total_batch_size))
-        a_padded = a_padded.at[..., :actual_samples].set(a_data[..., start_idx:end_idx])
-        if actual_samples > 0:
-            last_sample = a_data[..., end_idx-1:end_idx]
-            for i in range(actual_samples, total_batch_size):
-                a_padded = a_padded.at[..., i:i+1].set(last_sample)
-        a_batch = a_padded
-    else:
-        a_batch = a_data[..., start_idx:start_idx + total_batch_size]
-
-    # a_batch shape: (128, 400) -> (400, 128) -> (4, 100, 128)
-    
-    a_batch = jnp.transpose(a_batch, (2, 0, 1)).reshape(n_devices, batch_size, a_data.shape[0], a_data.shape[1])
-
-    return a_batch
-
 
 def train_rebano_sequential(config_rebano, pinns, col_points,
-                            quad_weights, a_data, f_data, test_fn_values, grad_test_fn_values, grad_u_precomp, u_bc_precomp, gram_matrix, v1, wandb_config):
+                            quad_weights, a_data, f_data, test_fn_values, grad_test_fn_values, grad_u_precomp, u_bc_precomp, gram_matrix, G_diag, wandb_config):
     """Sequential ReBaNO training - fallback when pmap is not available."""
     try:
         max_steps = config_rebano.max_steps
@@ -282,10 +262,10 @@ def train_rebano_sequential(config_rebano, pinns, col_points,
         tol_grad = 1e-9
         
     def residual_loss_rebano(params, quad_weights, loss_data):
-            return darcy_residual_loss_precomp(params, quad_weights, grad_u_precomp, test_fn_values, grad_test_fn_values, gram_matrix, v1, loss_data)
+            return darcy_residual_loss_precomp(params, quad_weights, grad_u_precomp, test_fn_values, grad_test_fn_values, gram_matrix, G_diag, loss_data)
 
     def residual_loss_grad_rebano(params, quad_weights, loss_data):
-            return darcy_residual_loss_grad(params, quad_weights, grad_u_precomp, test_fn_values, grad_test_fn_values, gram_matrix, v1, loss_data)
+            return darcy_residual_loss_grad(params, quad_weights, grad_u_precomp, test_fn_values, grad_test_fn_values, gram_matrix, G_diag, loss_data)
         
     def boundary_loss_rebano(params, quad_weights, loss_data=None):
             return darcy_boundary_loss_precomp(params, u_bc_precomp, quad_weights)
@@ -348,7 +328,7 @@ def train_rebano_sequential(config_rebano, pinns, col_points,
     pbar_samples.close()
     
     print(f'\nSequential ReBaNO Training Complete!')
-    print(f'Best sample: {idx_max} with loss {loss_max:.5e}')
+    print(f'Worst sample: {idx_max} with loss {loss_max:.5e}')
     
     if wandb_config and wandb_config.enabled:
         log_data = {'idx_max': idx_max, 'loss_max': loss_max}
@@ -405,24 +385,24 @@ def main():
     Yi, Yf = config.domain.Yi, config.domain.Yf
     
     # Create test grid matching input spatial dimensions  
-    xy_test = spatial_grid2d(Xi, Xf, Yi, Yf, Nx, Ny, 'uniform')[0]
+    xy_test = spatial_grid2d(Xi, Xf, Yi, Yf, Nx, Ny, endpoint=True)[0]
 
     x_grid, y_grid = spatial_grid1d(Xi, Xf, Nelem_x+1, sampling_method='uniform', endpoint=True)[0], spatial_grid1d(Yi, Yf, Nelem_y+1, sampling_method='uniform', endpoint=True)[0]
     dx, dy = x_grid[1]-x_grid[0], y_grid[1]-y_grid[0]
     
     xy_bc, weights_bc = spatial_grid2d_bc(Xi, Xf, Yi, Yf, N_bc, N_bc, 'uniform')
     xy_bc = jnp.stack([xy_bc[0], xy_bc[1], xy_bc[2], xy_bc[3]], axis=0)
-    weights_bc = jnp.stack([weights_bc[0], weights_bc[1], weights_bc[2], weights_bc[3]], axis=0)
+    quadw_bc = jnp.stack([weights_bc[0], weights_bc[1], weights_bc[2], weights_bc[3]], axis=0)
     
     xy_bc_flatten = xy_bc.reshape(-1, 2)
     
     # Create interpolation grids matching input data dimensions
-    x_interp_grid = spatial_grid1d(Xi, Xf, Nx)[0].flatten()
-    y_interp_grid = spatial_grid1d(Yi, Yf, Ny)[0].flatten()
+    x_interp_grid = spatial_grid1d(Xi, Xf, Nx, endpoint=True)[0].flatten()
+    y_interp_grid = spatial_grid1d(Yi, Yf, Ny, endpoint=True)[0].flatten()
     
-    v1 = gram_coef(dx, dy)[0]
-    G = gram_mat(Nelem_x-1, Nelem_y-1, dx, dy)
-
+    G_diag = gram_coef(dx, dy)[0]
+    G = gram_mat(Nelem_x-1, Nelem_y-1, dx, dy, 'functional')
+    
     quad_xy = jnp.zeros((Nelem_y-1, Nelem_x-1, N_quad, 2))
     quadw_xy = jnp.zeros((Nelem_y-1, Nelem_x-1, N_quad))
     test_fn_values = jnp.zeros((Nelem_y-1, Nelem_x-1, N_quad))
@@ -475,7 +455,7 @@ def main():
     train_pinn_config = config.pinn.train
     
     quad_points   = {'residual': quad_xy, 'boundary': xy_bc}
-    quad_weights = {'residual': quadw_xy, 'boundary': weights_bc}
+    quad_weights = {'residual': quadw_xy, 'boundary': quadw_bc}
 
     w_resid_pinn = train_pinn_config.w_residual
     w_bc_pinn = train_pinn_config.w_bc
@@ -561,13 +541,24 @@ def main():
         
         pinn_state = create_train_state(key, pinn, train_pinn_config,
                                         quad_points['residual'], loss_data)
-        
+
+
         t0_train_pinn = time.perf_counter()
-        pinn_state = train_pinn(pinn_state, quad_points, quad_weights,
+        pinn_state, weights_pinn = train_pinn(pinn_state, quad_points, quad_weights,
                                 test_fn_values, grad_test_fn_values,
-                                G, v1,
+                                G, G_diag,
                                 weights_pinn, alpha,
-                                max_steps=train_pinn_steps, wandb_config=config.wandb)
+                                max_steps=train_pinn_steps, update_weights=train_pinn_config.update_weights,
+                                wandb_config=config.wandb)
+        
+        # L-BFGS fine-tuning
+        if hasattr(train_pinn_config, 'fine_tune') and train_pinn_config.fine_tune.enabled:
+            print("\nStart fine tuning ... \n")
+            lbfgs_tx = create_optimizer(train_pinn_config.fine_tune)
+            pinn_state = pinn_state.replace(tx=lbfgs_tx, opt_state=lbfgs_tx.init(pinn_state.params))
+            pinn_state, weights_pinn = train_pinn(pinn_state, quad_points, quad_weights,
+                                   test_fn_values, grad_test_fn_values, G, G_diag,
+                                   weights_pinn, alpha, max_steps=train_pinn_config.fine_tune.max_steps, update_weights=train_pinn_config.fine_tune.update_weights, wandb_config=config.wandb)
         jax.tree_util.tree_map(
             lambda x: x.block_until_ready(), pinn_state.params,
         )
@@ -600,9 +591,14 @@ def main():
         ax[2].set_title('Absolute Error')
         
         # Add colorbars for each subplot
-        fig.colorbar(im0, ax=ax[0], fraction=0.046, pad=0.04)
-        fig.colorbar(im1, ax=ax[1], fraction=0.046, pad=0.04)
-        fig.colorbar(im2, ax=ax[2], fraction=0.046, pad=0.04)
+        cbar0 = fig.colorbar(im0, ax=ax[0], fraction=0.046, pad=0.04)
+        cbar1 = fig.colorbar(im1, ax=ax[1], fraction=0.046, pad=0.04)
+        cbar2 = fig.colorbar(im2, ax=ax[2], fraction=0.046, pad=0.04)
+        
+        cbar2.formatter = ScalarFormatter(useMathText=True)
+        cbar2.formatter.set_scientific(True)
+        cbar2.formatter.set_powerlimits((-6, -4))
+        cbar2.update_ticks()
 
         fig.tight_layout()
         plt.savefig(f"./pinn_sol{n+1}.pdf")
@@ -635,7 +631,7 @@ def main():
         idx_max, loss_max = train_rebano(train_rebano_config, 
                                          pinn_list, quad_points, quad_weights, a_data, f_data, 
                                          test_fn_values, grad_test_fn_values,
-                                         grad_u_precomp[:n+1], u_bc_precomp[:n+1], G, v1,
+                                         grad_u_precomp[:n+1], u_bc_precomp[:n+1], G, G_diag,
                                          available_devices, use_pmap, batch_size, wandb_config=config.wandb)
         t1_train_rebano = time.perf_counter()
         

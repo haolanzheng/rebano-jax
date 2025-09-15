@@ -58,11 +58,11 @@ def get_train_config():
     # pinn configs
     config.pinn       = pinn = ConfigDict()
     pinn.arch        = 'PirateNet'
-    pinn.num_layers  = 2
-    pinn.hidden_dim  = 40
+    pinn.num_layers  = 1
+    pinn.hidden_dim  = 32
     pinn.out_dim     = 1
     pinn.embed_scale = 0.1
-    pinn.embed_dim   = 128
+    pinn.embed_dim   = 64
     pinn.init_fn     = 'glorot_normal'
     pinn.activation  = 'tanh'
     pinn.fact_weight = True

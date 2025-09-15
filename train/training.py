@@ -134,7 +134,7 @@ def make_step(loss_fns: Dict[str, Callable]):
         
         def total_loss_fn(p):                               
             return sum(
-                new_weights[name] * fns[i](state.apply_fn, p, batch[name], state.loss_data[name])
+                new_weights[name] * fns[i](state.apply_fn, p, batch[name], quad_weights[name], state.loss_data[name])
                 for i, name in enumerate(names)
             )
         
@@ -198,7 +198,7 @@ def make_step_rebano(loss_precomp: Dict[str, Callable], loss_grads_precomp: Dict
         
         def total_loss_fn(p):                               
             return sum(
-                new_weights[name] * loss_fns[i](p, state.loss_data[name])
+                new_weights[name] * loss_fns[i](p, quad_weights[name], state.loss_data[name])
                 for i, name in enumerate(names)
             )
         

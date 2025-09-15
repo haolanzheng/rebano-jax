@@ -23,7 +23,7 @@ try:
     from ..train.precomp import compute_lap_u_scalar
     from ..configs.poisson_config import get_train_config
     from ..utils.grids import spatial_grid1d, spatial_grid1d_bc
-    from ..utils.utilities import get_u, save_pinn_checkpoint, load_checkpoint, count_params
+    from ..utils.utilities import get_u, save_pinn_checkpoint, load_checkpoint, count_params, prepare_pmap_batch
 except ImportError:
     sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from models.nets import PINN, ReBaNO
@@ -32,7 +32,7 @@ except ImportError:
     from train.precomp import compute_lap_u_scalar
     from configs.poisson_config import get_train_config
     from utils.grids import spatial_grid1d, spatial_grid1d_bc
-    from utils.utilities import get_u, save_pinn_checkpoint, load_checkpoint, count_params
+    from utils.utilities import get_u, save_pinn_checkpoint, load_checkpoint, count_params, prepare_pmap_batch
 
 
 
@@ -96,7 +96,7 @@ def train_rebano(config_rebano, pinns, col_points, quad_weights,
     """Train the ReBaNO on the Poisson problem with pmap parallelization."""
     
     n_devices = len(available_devices)
-    if not use_pmap or n_devices == 1:
+    if not use_pmap:
         print("Using sequential processing")
         return train_rebano_sequential(config_rebano, pinns, 
                                        col_points, quad_weights,
@@ -196,7 +196,7 @@ def train_rebano_pmap(config_rebano, pinns, col_points, quad_weights,
             break
         
         batch_f_data = prepare_pmap_batch(
-            f_data, start_idx, end_idx, samples_per_device_batch, n_devices
+            f_data, start_idx, end_idx, samples_per_device_batch, n_devices, batch_axis=-1
         )
         
         try:
@@ -248,28 +248,6 @@ def train_rebano_pmap(config_rebano, pinns, col_points, quad_weights,
         wandb.log(log_data)
     
     return global_idx_max, global_loss_max
-
-
-def prepare_pmap_batch(f_data, start_idx, end_idx, batch_size, n_devices):
-    """Prepare data for pmap - reshape to (n_devices, batch_size, spatial_dim)"""
-    actual_samples = end_idx - start_idx
-    total_batch_size = batch_size * n_devices
-    
-    if actual_samples < total_batch_size:
-        f_padded = jnp.zeros((f_data.shape[0], total_batch_size))
-        f_padded = f_padded.at[:, :actual_samples].set(f_data[:, start_idx:end_idx])
-        if actual_samples > 0:
-            last_sample = f_data[:, end_idx-1:end_idx]
-            for i in range(actual_samples, total_batch_size):
-                f_padded = f_padded.at[:, i:i+1].set(last_sample)
-        f_batch = f_padded
-    else:
-        f_batch = f_data[:, start_idx:start_idx + total_batch_size]
-    
-    # f_batch shape: (128, 400) -> (400, 128) -> (4, 100, 128)
-    f_batch = f_batch.T.reshape(n_devices, batch_size, -1)
-    
-    return f_batch
 
 
 def train_rebano_sequential(config_rebano, pinns, col_points,

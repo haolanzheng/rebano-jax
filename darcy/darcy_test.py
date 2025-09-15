@@ -9,6 +9,7 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 from jax import jit, pmap, vmap, devices, local_device_count
+from jax.scipy.interpolate import RegularGridInterpolator
 from ml_collections import ConfigDict
 import sys
 from functools import partial
@@ -16,120 +17,116 @@ from tqdm import tqdm
 import wandb
 import time
 
+
 try:
     from ..models.nets import PINN, ReBaNO
-    from .poisson_losses import *
-    from ..train.training import make_step, create_train_state, make_step_rebano
-    from ..train.precomp import compute_lap_u_scalar
-    from ..configs.poisson_config import get_test_config
-    from ..utils.grids import spatial_grid1d, spatial_grid1d_bc
-    from ..utils.utilities import get_u, save_pinn_checkpoint, load_checkpoint, prepare_pmap_batch
+    from .darcy_losses import *
+    from ..train.training import create_train_state, make_step_rebano, create_optimizer
+    from ..train.precomp import compute_grad_u
+    from ..configs.darcy_config import get_test_config
+    from ..utils.grids import spatial_grid1d, spatial_grid2d, spatial_grid2d_bc
+    from ..utils.utilities import get_u, load_checkpoint, prepare_pmap_batch
+    from .test_fns import *
 except ImportError:
     sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from models.nets import PINN, ReBaNO
-    from poisson_losses import *
-    from train.training import make_step, create_train_state, make_step_rebano
-    from train.precomp import compute_lap_u_scalar
-    from configs.poisson_config import get_test_config
-    from utils.grids import spatial_grid1d, spatial_grid1d_bc
-    from utils.utilities import get_u, save_pinn_checkpoint, load_checkpoint, prepare_pmap_batch
+    from darcy_losses import *
+    from train.training import create_train_state, make_step_rebano, create_optimizer
+    from train.precomp import compute_grad_u
+    from configs.darcy_config import get_test_config
+    from utils.grids import spatial_grid1d, spatial_grid2d, spatial_grid2d_bc
+    from utils.utilities import get_u, load_checkpoint, prepare_pmap_batch
+    from test_fns import *
 
 
-def test_rebano(config_rebano, pinns, col_points, quad_weights,
-                 f_data, u_xx_precomp, u_bc_precomp, available_devices,
+def test_rebano(config_rebano, pinns, col_points, quad_weights, a_data,
+                 f_data, test_fn_values, grad_test_fn_values, grad_u_precomp, u_bc_precomp, gram_matrix, G_diag, available_devices,
                  use_pmap, batch_size, wandb_config=None):
-    """Test the ReBaNO on the Poisson problem with pmap parallelization."""
+    """Test the ReBaNO on the Darcy problem with pmap parallelization."""
     
     n_devices = len(available_devices)
-    if not use_pmap or n_devices == 1:
+    if not use_pmap:
         print("Using sequential processing")
         return test_rebano_sequential(config_rebano, pinns, 
-                                      col_points, quad_weights,
-                                       f_data, u_xx_precomp, u_bc_precomp, wandb_config)
+                                       col_points, quad_weights, a_data,
+                                       f_data, test_fn_values, grad_test_fn_values, grad_u_precomp, u_bc_precomp, gram_matrix, G_diag, wandb_config)
 
     print(f"Using pmap with {n_devices} devices, batch size {batch_size}")
-    return test_rebano_pmap(config_rebano, pinns, col_points,
-                             quad_weights, f_data,
-                             u_xx_precomp, u_bc_precomp, 
-                             n_devices, batch_size, available_devices, wandb_config)
+    return test_rebano_pmap(config_rebano, pinns, col_points, 
+                             quad_weights, a_data, f_data, test_fn_values, grad_test_fn_values, grad_u_precomp,  u_bc_precomp, gram_matrix, G_diag, n_devices, batch_size, available_devices, wandb_config)
 
 
 def test_rebano_pmap(config_rebano, pinns, col_points, quad_weights,
-                     f_data, u_xx_precomp, u_bc_precomp,
-                      n_devices, batch_size, available_devices, wandb_config):
+                      a_data, f_data, test_fn_values, grad_test_fn_values, grad_u_precomp, u_bc_precomp, gram_matrix, G_diag, n_devices, batch_size, available_devices, wandb_config):
     """Parallel ReBaNO training using pmap."""
     try: 
         max_steps = config_rebano.max_steps
-        alpha = config_rebano.alpha
+        alpha     = config_rebano.alpha
     except AttributeError:
-        max_steps = 5000
+        max_steps = 2000
         alpha = 0.8
         
     dummy_key = jax.random.PRNGKey(0)
-    
-    update_weights = config_rebano.update_weights
-    
-    n_samples = f_data.shape[1]
+
+    n_samples = a_data.shape[-1]
     n_neurons = len(pinns)
     
-    def test_single_sample(f_sample):
-        f_sample = f_sample.reshape(-1, 1)
+    def test_single_sample(a_sample):
         c_initial = jnp.full((n_neurons,), 1.0/n_neurons)
         rebano = ReBaNO(pinns, c_initial)
         
-        loss_data = {'residual': {'f': f_sample}, 'boundary': None}
-        loss_weights = {'residual': config_rebano.w_residual, 
-                       'boundary': config_rebano.w_bc}
+        loss_data = {'residual': {'a': a_sample, 'f': f_data}, 'boundary': None}
+        loss_weights = {'residual': config_rebano.w_residual, 'boundary': config_rebano.w_bc}
         
         state = create_train_state(dummy_key, rebano, config_rebano,
                                    col_points['residual'], loss_data)
-        
-        def boundary_loss_rebano(params, quad_weights,  loss_data=None):
-            return poisson_boundary_loss_precomp(params, quad_weights, u_bc_precomp)
-
-        def boundary_loss_grad_rebano(params, quad_weights, loss_data=None):
-            return poisson_boundary_loss_grad(params, quad_weights, u_bc_precomp)
 
         def residual_loss_rebano(params, quad_weights, loss_data):
-            return poisson_residual_loss_precomp(params, quad_weights, u_xx_precomp, loss_data)
+            return darcy_residual_loss_precomp(params, quad_weights, grad_u_precomp, test_fn_values, grad_test_fn_values, gram_matrix, G_diag, loss_data)
 
         def residual_loss_grad_rebano(params, quad_weights, loss_data):
-            return poisson_residual_loss_grad(params, quad_weights, u_xx_precomp, loss_data)
+            return darcy_residual_loss_grad(params, quad_weights, grad_u_precomp, test_fn_values, grad_test_fn_values, gram_matrix, G_diag, loss_data)
+        
+        def boundary_loss_rebano(params, quad_weights, loss_data=None):
+            return darcy_boundary_loss_precomp(params, u_bc_precomp, quad_weights)
+
+        def boundary_loss_grad_rebano(params, quad_weights, loss_data=None):
+            return darcy_boundary_loss_grad(params, u_bc_precomp, quad_weights)
 
         loss_fns = {'residual': residual_loss_rebano, 'boundary': boundary_loss_rebano}
         grad_fns = {'residual': residual_loss_grad_rebano, 'boundary': boundary_loss_grad_rebano}
-        
+
         step_fn = make_step_rebano(loss_fns, grad_fns)
         
         def loop_body(step, carry):
             state, loss_weights = carry
-            state, loss_weights, metrics = step_fn(state, quad_weights, loss_weights, adaptive_weights=update_weights, alpha=alpha)
+            state, loss_weights, metrics = step_fn(state, quad_weights, loss_weights)
             return (state, loss_weights)
         
         # max_steps = 2000
         final_state, final_loss_weights = jax.lax.fori_loop(0, max_steps, loop_body, (state, loss_weights))
         
         # Get final loss
-        final_state, _, final_metrics = step_fn(final_state, quad_weights, final_loss_weights, adaptive_weights=update_weights, alpha=alpha)
+        final_state, _, final_metrics = step_fn(final_state, quad_weights, final_loss_weights)
         final_loss = final_metrics['true loss']
         
         return final_state, final_loss
-    
-    def test_batch_samples(f_batch):
-        batch_states, batch_losses = vmap(test_single_sample)(f_batch)
+
+    def test_batch_samples(a_batch):
+        batch_states, batch_losses = vmap(test_single_sample)(a_batch)
         return batch_states, batch_losses 
     
     pmap_test_batch = pmap(test_batch_samples, axis_name='device',
                             devices=available_devices)
     
-    warm_f = jnp.zeros((n_devices, batch_size, f_data.shape[0]), dtype=f_data.dtype)
-    warm_states, warm_losses = pmap_test_batch(warm_f)
+    warm_a = jnp.zeros((n_devices, batch_size, *a_data.shape[:-1]), dtype=a_data.dtype)
+    warm_states, warm_losses = pmap_test_batch(warm_a)
     jax.block_until_ready(warm_losses)
 
     samples_per_device_batch = batch_size
     total_batch_size = samples_per_device_batch * n_devices
     n_batches = (n_samples + total_batch_size - 1) // total_batch_size
-
+    
     processed_samples = 0
     
     print(f"Processing {n_samples} samples in {n_batches} parallel batches")
@@ -146,12 +143,12 @@ def test_rebano_pmap(config_rebano, pinns, col_points, quad_weights,
         if start_idx >= n_samples:
             break
         
-        batch_f_data = prepare_pmap_batch(
-            f_data, start_idx, end_idx, samples_per_device_batch, n_devices, batch_axis=-1
+        batch_a_data = prepare_pmap_batch(
+            a_data, start_idx, end_idx, samples_per_device_batch, n_devices, batch_axis=-1
         )
         
         try:
-            batch_states, batch_losses = pmap_test_batch(batch_f_data)
+            batch_states, batch_losses = pmap_test_batch(batch_a_data)
             jax.block_until_ready(batch_states)
             
             actual_samples_in_batch = min(end_idx - start_idx, total_batch_size)
@@ -197,49 +194,49 @@ def test_rebano_pmap(config_rebano, pinns, col_points, quad_weights,
     return states
 
 
-def test_rebano_sequential(config_rebano, pinns, col_points, 
-                           quad_weights, f_data, u_xx_precomp, u_bc_precomp, wandb_config):
+
+def test_rebano_sequential(config_rebano, pinns, col_points,
+                            quad_weights, a_data, f_data, test_fn_values, grad_test_fn_values, grad_u_precomp, u_bc_precomp, gram_matrix, G_diag, wandb_config):
     """Sequential ReBaNO testing - fallback when pmap is not available."""
     try:
         max_steps = config_rebano.max_steps
-        tol_grad  = config_rebano.tol_grad
+        alpha = config_rebano.alpha
     except AttributeError:
-        max_steps = 5000
-        tol_grad  = 1e-9
-    
-    def boundary_loss_rebano(params, quad_weights, loss_data=None):
-        return poisson_boundary_loss_precomp(params, quad_weights, u_bc_precomp)
-
-    def boundary_loss_grad_rebano(params, quad_weights, loss_data=None):
-        return poisson_boundary_loss_grad(params, quad_weights, u_bc_precomp)
-
+        max_steps = 2000
+        alpha = 0.8
+        
     def residual_loss_rebano(params, quad_weights, loss_data):
-        return poisson_residual_loss_precomp(params, quad_weights, u_xx_precomp, loss_data)
+            return darcy_residual_loss_precomp(params, quad_weights, grad_u_precomp, test_fn_values, grad_test_fn_values, gram_matrix, G_diag, loss_data)
 
     def residual_loss_grad_rebano(params, quad_weights, loss_data):
-        return poisson_residual_loss_grad(params, quad_weights, u_xx_precomp, loss_data)
+            return darcy_residual_loss_grad(params, quad_weights, grad_u_precomp, test_fn_values, grad_test_fn_values, gram_matrix, G_diag, loss_data)
+        
+    def boundary_loss_rebano(params, quad_weights, loss_data=None):
+            return darcy_boundary_loss_precomp(params, u_bc_precomp, quad_weights)
 
-    n_samples = f_data.shape[1]
+    def boundary_loss_grad_rebano(params, quad_weights, loss_data=None):
+            return darcy_boundary_loss_grad(params, u_bc_precomp, quad_weights)
+
+    n_samples = a_data.shape[-1]
     n_neurons = len(pinns)
     
     dummy_key = jax.random.PRNGKey(0)
-    update_weights = config_rebano.update_weights
-    alpha = config_rebano.alpha
 
     pbar_samples = tqdm(range(n_samples), desc="Sequential ReBaNO Training",
                         bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]')
     
+    idx_max = 0
+    loss_max = 0.0
+    
     loss_fns = {'residual': residual_loss_rebano, 'boundary': boundary_loss_rebano}
     grad_fns = {'residual': residual_loss_grad_rebano, 'boundary': boundary_loss_grad_rebano}
-    
-    states = []
-    
+
     for sample_idx in pbar_samples:
-        f_sample = f_data[:, sample_idx:sample_idx+1]
+        a_sample = a_data[..., sample_idx]
         c_initial = jnp.full((n_neurons,), 1.0/n_neurons)
         rebano = ReBaNO(pinns, c_initial)
         
-        loss_data = {'residual': {'f': f_sample}, 'boundary': None}
+        loss_data = {'residual': {'a': a_sample, 'f': f_data}, 'boundary': None}
         loss_weights = {'residual': config_rebano.w_residual, 'boundary': config_rebano.w_bc}
         
         state = create_train_state(dummy_key, rebano, config_rebano,
@@ -247,8 +244,9 @@ def test_rebano_sequential(config_rebano, pinns, col_points,
 
         step_fn = make_step_rebano(loss_fns, grad_fns)
         
+        states = []
         for step in range(max_steps):
-            state, loss_weights, metrics = step_fn(state, quad_weights, loss_weights, adaptive_weights=update_weights, alpha=alpha)
+            state, loss_weights, metrics = step_fn(state, quad_weights, loss_weights)
             jax.block_until_ready(metrics['true loss'])
             
             loss_value = metrics['true loss']
@@ -260,7 +258,7 @@ def test_rebano_sequential(config_rebano, pinns, col_points,
         pbar_samples.set_postfix({
             'total samples': n_samples,
         })
-    
+
     pbar_samples.close()
     
     print(f'\nSequential ReBaNO Testing Complete!')
@@ -309,42 +307,111 @@ def main():
             wandb.init(
                 project=config.wandb.project,
                 entity=config.wandb.entity,
-                name=f"poisson_rebano_neurons_{config.num_neurons}_test",
+                name=f"darcy_rebano_neurons_{config.num_neurons}_test",
                 config=config.to_dict()
             )
             print(f"Wandb initialized successfully for project: {config.wandb.project}")
         except Exception as e:
             print(f"Warning: Failed to initialize wandb: {e}")
-            print("Continuing testing without wandb logging...")
+            print("Continuing training without wandb logging...")
             # Disable wandb for this run
             config.wandb.enabled = False
 
     num_neurons = config.num_neurons
 
     # loading data
-    offset  = config.data.offset
-    n_test  = config.data.n_samples
-
-    inputs  = np.load(config.data.inputs_dir)[::config.data.sub_x, offset:n_test+offset].astype(np.float32)
-    outputs = np.load(config.data.outputs_dir)[::config.data.sub_x, offset:n_test+offset].astype(np.float32)  
-
+    offset = config.data.offset
+    n_test = config.data.n_samples
+    
+    inputs  = np.load(config.data.inputs_dir)[::config.data.sub_x, ::config.data.sub_y, offset:n_test+offset].astype(np.float32)
+    outputs = np.load(config.data.outputs_dir)[::config.data.sub_x, ::config.data.sub_y, offset:n_test+offset].astype(np.float32)
+    
+    Ny, Nx = inputs.shape[0], inputs.shape[1]
+    
     inputs  = jnp.array(inputs.astype(np.float32))
-    outputs = jnp.array(outputs.astype(np.float32))
-
-    Nx = inputs.shape[0]
+    outputs = jnp.array(outputs.reshape(-1, n_test).astype(np.float32))
+        
+    Nelem_x, Nelem_y = config.domain.Nelem_x, config.domain.Nelem_y
+    N_nodes = (Nelem_x-1) * (Nelem_y-1) # interior nodes only
+    N_quad_1d = config.domain.N_quad  # Number of quadrature points per dimension
+    N_quad = N_quad_1d**2  # Total quadrature points per element
+    N_bc   = config.domain.N_bc 
     Xi, Xf = config.domain.Xi, config.domain.Xf
-    x_resid, quadw_resid = spatial_grid1d(Xi, Xf, Nx)
-    x_bc, quadw_bc       = spatial_grid1d_bc(Xi, Xf)
+    Yi, Yf = config.domain.Yi, config.domain.Yf
+    
+    # Create test grid matching input spatial dimensions  
+    xy_test = spatial_grid2d(Xi, Xf, Yi, Yf, Nx, Ny, endpoint=True)[0]
+
+    x_grid, y_grid = spatial_grid1d(Xi, Xf, Nelem_x+1, sampling_method='uniform', endpoint=True)[0], spatial_grid1d(Yi, Yf, Nelem_y+1, sampling_method='uniform', endpoint=True)[0]
+    dx, dy = x_grid[1]-x_grid[0], y_grid[1]-y_grid[0]
+    
+    xy_bc, weights_bc = spatial_grid2d_bc(Xi, Xf, Yi, Yf, N_bc, N_bc, 'uniform')
+    xy_bc = jnp.stack([xy_bc[0], xy_bc[1], xy_bc[2], xy_bc[3]], axis=0)
+    quadw_bc = jnp.stack([weights_bc[0], weights_bc[1], weights_bc[2], weights_bc[3]], axis=0)
+    
+    xy_bc_flatten = xy_bc.reshape(-1, 2)
+    
+    # Create interpolation grids matching input data dimensions
+    x_interp_grid = spatial_grid1d(Xi, Xf, Nx, endpoint=True)[0].flatten()
+    y_interp_grid = spatial_grid1d(Yi, Yf, Ny, endpoint=True)[0].flatten()
+    
+    G_diag = gram_coef(dx, dy)[0]
+    G = gram_mat(Nelem_x-1, Nelem_y-1, dx, dy, 'functional')
+    
+    quad_xy = jnp.zeros((Nelem_y-1, Nelem_x-1, N_quad, 2))
+    quadw_xy = jnp.zeros((Nelem_y-1, Nelem_x-1, N_quad))
+    test_fn_values = jnp.zeros((Nelem_y-1, Nelem_x-1, N_quad))
+    grad_test_fn_values = jnp.zeros((Nelem_y-1, Nelem_x-1, N_quad, 2))
+
+    for j in range(Nelem_x-1):
+        for i in range(Nelem_y-1):
+            xy_elem, weight_elem = spatial_grid2d(x_grid[j], x_grid[j+2], y_grid[i], y_grid[i+2], N_quad_1d, N_quad_1d, 'gauss')
+            
+            quad_xy = quad_xy.at[i, j].set(xy_elem)
+            quadw_xy = quadw_xy.at[i, j].set(weight_elem.squeeze(-1))
+            
+            test_fn_elem = test_fn_linear2d(x_grid[j], x_grid[j+1], x_grid[j+2], y_grid[i], y_grid[i+1], y_grid[i+2], xy_elem)
+            grad_test_fn_elem = grad_test_fn_linear2d(x_grid[j], x_grid[j+1], x_grid[j+2], y_grid[i], y_grid[i+1], y_grid[i+2], xy_elem)
+            test_fn_values = test_fn_values.at[i, j].set(test_fn_elem)
+            grad_test_fn_values = grad_test_fn_values.at[i, j].set(grad_test_fn_elem)
+    
+    quad_xy = quad_xy.reshape(N_nodes, N_quad, 2)
+    quadw_xy = quadw_xy.reshape(N_nodes, N_quad)
+    test_fn_values = test_fn_values.reshape(N_nodes, N_quad)
+    grad_test_fn_values = grad_test_fn_values.reshape(N_nodes, N_quad, 2)
+    
+
+    a_fns = []
+    for i in range(n_test):
+        a_sample = inputs[:, :, i]
+        interpolator = RegularGridInterpolator(
+            (x_interp_grid, y_interp_grid), 
+            a_sample, 
+            method='linear',
+            fill_value=0.0
+        )
+        a_fns.append(interpolator)
+    
+    a_data = jnp.zeros((N_nodes, N_quad, n_test))
+    for i in range(n_test):
+        a_val_flat = a_fns[i](quad_xy.reshape(-1, 2))
+        a_val = a_val_flat.reshape(N_nodes, N_quad)
+        a_data = a_data.at[:, :, i].set(a_val)
+
+    if jnp.any(jnp.isnan(a_data)):
+        raise ValueError("NaN values found in a_data")
+    
+    f_data = jnp.ones((N_nodes, N_quad), dtype=jnp.float32)
 
     print('\ntotal number of input functions', inputs.shape[-1])
     
-    col_points = {'residual': x_resid, 'boundary': x_bc}
-    quad_weights = {'residual': quadw_resid, 'boundary': quadw_bc}
+    quad_points = {'residual': quad_xy, 'boundary': xy_bc}
+    quad_weights = {'residual': quadw_xy, 'boundary': quadw_bc}
     
     test_rebano_config = config.test
     
-    u_xx_precomp = jnp.zeros((num_neurons, x_resid.shape[0], 1))
-    u_bc_precomp = jnp.zeros((num_neurons, x_bc.shape[0], 1))
+    grad_u_precomp = jnp.zeros((num_neurons, N_nodes, N_quad, 2))
+    u_bc_precomp   = jnp.zeros((num_neurons, 4, N_bc))
     
     pinn_list = []
     
@@ -369,38 +436,39 @@ def main():
     
     checkpoint_path = f"{test_rebano_config.load_pinn_dir}"
     for i in range(num_neurons):
-        pinn_ckpt = load_checkpoint(f"{checkpoint_path}" + f"poisson_pinn_{i+1}")
+        pinn_ckpt = load_checkpoint(f"{checkpoint_path}" + f"darcy_pinn_{i+1}")
         pinn_list.append(pinn_ckpt)
         pinn_config_loaded = ConfigDict(pinn_ckpt['metadata']['pinn_config'])
         pinn = PINN(pinn_config_loaded)
         apply_fn = get_u(pinn.apply)
         params   = pinn_ckpt['params']
-        u_xx = compute_lap_u_scalar(apply_fn, params, x_resid).reshape(-1, 1)
-        u_xx_precomp = u_xx_precomp.at[i].set(u_xx)
-        u_bc = vmap(lambda x: apply_fn(params, x))(x_bc).reshape(-1, 1)
-        u_bc_precomp = u_bc_precomp.at[i].set(u_bc)
+        grad_u_vals = vmap(lambda x: compute_grad_u(apply_fn, params, x))(quad_points['residual']).squeeze(-2)
+        grad_u_precomp = grad_u_precomp.at[i].set(grad_u_vals)
+        u_bc_values = vmap(lambda x: apply_fn(params, x))(xy_bc_flatten).squeeze(-1)
+        u_bc_values = u_bc_values.reshape(4, N_bc)
+        u_bc_precomp = u_bc_precomp.at[i].set(u_bc_values)
         
     print(f"Number of neurons loaded: {num_neurons}\n")
   
     t0 = time.perf_counter()
     states = test_rebano(test_rebano_config, pinn_list, 
-                        col_points, quad_weights, inputs, u_xx_precomp, u_bc_precomp, available_devices, use_pmap, batch_size, wandb_config=config.wandb)
+                        quad_points, quad_weights, a_data, f_data, test_fn_values, grad_test_fn_values, grad_u_precomp, u_bc_precomp, G, G_diag, available_devices, use_pmap, batch_size, wandb_config=config.wandb)
     t1 = time.perf_counter()
     
     print('\nReBaNO testing complete!')
     print(f"Total test time: {t1 - t0:.4f} seconds\n")
     
-    predictions, rel_errors = pred_and_error(states, x_resid, outputs)
+    predictions, rel_errors = pred_and_error(states, xy_test, outputs)
     predictions, rel_errors = jax.device_get(predictions), jax.device_get(rel_errors)
 
     os.makedirs(os.path.dirname(test_rebano_config.save_dir) if os.path.dirname(test_rebano_config.save_dir) else '.', exist_ok=True)
 
-    np.save(test_rebano_config.save_dir + f"poisson_rebano_predictions_s{Nx}.npy", predictions)
-    np.save(test_rebano_config.save_dir + f"poisson_rebano_rel_errors_s{Nx}.npy", rel_errors)
-    
-    print("ReBaNO predictions saved:", test_rebano_config.save_dir + f"poisson_rebano_predictions_s{Nx}.npy")
-    print("ReBaNO relative errors saved:", test_rebano_config.save_dir + f"poisson_rebano_rel_errors_s{Nx}.npy")
-    
+    np.save(test_rebano_config.save_dir + f"darcy_rebano_predictions_s{Nx}.npy", predictions)
+    np.save(test_rebano_config.save_dir + f"darcy_rebano_rel_errors_s{Nx}.npy", rel_errors)
+
+    print("ReBaNO predictions saved:", test_rebano_config.save_dir + f"darcy_rebano_predictions_s{Nx}.npy")
+    print("ReBaNO relative errors saved:", test_rebano_config.save_dir + f"darcy_rebano_rel_errors_s{Nx}.npy")
+
     mean_rel_err = np.mean(rel_errors)
     max_rel_err  = np.max(rel_errors)
     
